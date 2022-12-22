@@ -1,0 +1,68 @@
+version: 2
+template:
+  name: Build your own toolchain
+  description: APPC_STG_FRK_ARTEFACT
+  required:
+    - github_integrated20
+    - private_worker03
+toolchain:
+  name: APPC_STG_FRK_ARTEFACT
+services:
+  pipeline19:
+    parameters:
+      label: AppConnect CP4I Staging FRK
+      type: classic
+      name: AppConnect CP4I Staging FRK
+      ui_pipeline: true
+      api_url: hash:SHA3-512:829826a68cd1d470dc7a10a3e17308a5eae194118a909d9a18db148169873752bf7b66fe85459aba8bf4378ad841a80d772ae8a5d4d0f5a8506a34c662f22bc1
+      external_api_url: hash:SHA3-512:2de7e7852b09055e5a200b460079f88d476213da60be9c31ddeded7d7db756305eb944339f9d3e9d07718897d25a5467c0d592db1f394b22e47dcef4ee8f1ab6
+      configuration:
+        env:
+          private_worker03: '{{services.private_worker03.parameters.name}}'
+        content:
+          $text: pipeline_pipeline19.yml
+      services:
+        - github_integrated20
+        - private_worker03
+    service_id: pipeline
+  private_worker03:
+    parameters:
+      label: Private Worker Pipeline
+      name: Private Worker Pipeline
+      workerQueueIdentifier: ServiceId-c75a92d7-2860-4fef-a0e1-515e010dde4f
+      workerQueueCredentials:
+      configuration: hash:SHA3-512:ef550fa42754cea8dac8aa07368967fc3359bab073bb8b0e021ab37b4a92d77cc74377811c0fb3da28e1257bb79ba07f05c00c8df6ddc3dc91dde4675538c245
+    service_id: private_worker
+  github_integrated20:
+    parameters:
+      extra_capabilities:
+        - capability_id: git.issues
+          display_name: Issues
+          dashboard_url: https://github.ibm.com/Nike/CCS-INT/issues
+          label: CCS-INT
+          tags:
+            - think
+            - code
+          enabled: false
+          readme: false
+      label: CCS-INT
+      type: link
+      legal: true
+      owner_id: Nike
+      repo_name: CCS-INT
+      repo_url: https://github.ibm.com/Nike/CCS-INT.git
+      source_repo_url: ""
+      private_repo: true
+      has_issues: false
+      enable_traceability: false
+      integration_owner: IBMid-666000T26E
+      git_id: integrated
+      api_root_url: https://github.ibm.com/api
+      token_url: https://otc-github-consolidated-broker.eu-de.devops.cloud.ibm.com/github/token?git_id=integrated
+      authorized: ""
+      default_branch: ""
+      root_url: ""
+      legal_label: ""
+      namespace_table: ""
+      auto_init: false
+    service_id: github_integrated

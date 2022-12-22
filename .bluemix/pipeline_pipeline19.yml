@@ -1,0 +1,488 @@
+stages:
+  - inputs:
+      - branch: STG-Artefact-POC
+        type: git
+        service: github_integrated20
+    jobs:
+      - artifact_dir: ""
+        build_type: shell
+        curatedDockerImage: default
+        fail_stage: true
+        name: Build
+        script: |-
+          #!/bin/bash
+          #set -x
+          bash pipeline_scripts/detect_changed.sh  -p ${ENV} -d2  -b ${BUILD_NUMBER}
+        type: builder
+    name: DETECT CHANGES & Versioning
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+  - inputs:
+      - job: Build
+        stage: DETECT CHANGES & Versioning
+        type: job
+    jobs:
+      - artifact_dir: ""
+        build_type: customimage
+        curatedDockerImage: default
+        docker_image: de.icr.io/ccs-dev-sample-app/iib-root:latest
+        fail_stage: true
+        name: Build
+        script: "#!/bin/bash\nset -x\ncat /etc/os-release\n#apt-get clean\n#apt-get update \n#apt-get -f instal\n#apt-get install -y git\ngit --version\n#set it temporarily\nflag_code=1\n#source $ARCHIVE_DIR/build.properties\n\nls -l /opt/ibm/iib-10.0.0.11\n# BARs Creation\n#source pipeline_scripts/Versioning.sh AppConnect\nif [ \"$flag_code\" == \"1\" ]; then\n      chmod -R 777 pipeline_scripts\n      cd pipeline_scripts\n      for i in `find ./ -type f|xargs grep -l DB_` ;\n      do \n          sed -i \"s/<ENV>/$ENV/g\" $i;\n          sed -i \"s/<DB_HOST>/$DB_HOST/g\" $i;\n          sed -i \"s/<DB_NAME_CONF>/$APPC_DB_NAME_CONF/g\" $i; \n          sed -i \"s/<DB_AUTHORIZATION>/$DB_AUTHORIZATION/g\" $i;  \n          sed -i \"s/<KAFKA_CONSUMER_INSTANCES>/$KAFKA_CONSUMER_INSTANCES/g\" $i;\n          sed -i \"s/<INTEGRATION_FLOW_INSTANCES>/$INTEGRATION_FLOW_INSTANCES/g\" $i;\n          sed -i \"s/<LOGGER_TOPIC>/$LOGGER_TOPIC/g\" $i;\n          sed -i \"s/<KAFKA_BOOTSTRAP_SERVERS>/$KAFKA_BOOTSTRAP_SERVERS/g\" $i;\n          sed -i \"s/<KAFKA_GROUP_ID>/$KAFKA_GROUP_ID/g\" $i;\n          sed -i \"s/<COS_SUFFIX>/$COS_SUFFIX/g\" $i;\n          sed -i \"s/<COS_API_KEY>/$COS_API_KEY/g\" $i;\n          sed -i \"s/<LOW_FREQUENCY_INTEGRATION_FLOW_INSTANCES>/$LOW_FREQUENCY_INTEGRATION_FLOW_INSTANCES/g\" $i;\n      done\n      cat  bars_creation_configuration.sh\n      cd ..\n      source pipeline_scripts/build_bars.sh -e $ENV\n      #source pipeline_scripts/build_c4tdeclaration.sh -e $ENV\nfi\n\n\n[ -z \"$ARCHIVE_DIR\" ] && ARCHIVE_DIR=$PWD\n#echo \"declare -A ARTIFACTS_URL\" >> $ARCHIVE_DIR/bars.txt\n\nfor i in ${!ARTIFACTS_URL[@]};\ndo \n#echo \"ARTIFACTS_URL[$i]=${ARTIFACTS_URL[$i]}\" >> \"$ARCHIVE_DIR/bars.txt\"\necho \"$i=${ARTIFACTS_URL[$i]}\" >> \"$ARCHIVE_DIR/bars.txt\"\ndone;\n\ncat bars.txt\n\nTIME_STAMP=$(date +%d%m%Y%H%M%S) && echo \"TIME_STAMP=${TIME_STAMP}\"\n\n#TAG=$(git rev-parse --short HEAD)-${TIME_STAMP}\n#echo \"TAG=$TAG\">build.properties\n\nsed -i \"s/<TIME_STAMP>/$TIME_STAMP/g\" build.properties;\n"
+        type: builder
+    name: Build BARs
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers:
+      - type: stage
+  - inputs:
+      - job: Build
+        stage: Build BARs
+        type: job
+    jobs:
+      - artifact_dir: ""
+        build_type: cr
+        curatedDockerImage: default
+        fail_stage: true
+        image_name: appconnect
+        name: Image Build
+        namespace: appc-stg
+        script: "#!/bin/bash\nset -x\n\ncat bars.txt\nsource bars.txt\nsource build.properties\n\ncat /etc/os-release\n\necho -e \"Build environment variables:\"\necho \"REGISTRY_URL=${REGISTRY_URL}\"\necho \"REGISTRY_NAMESPACE=${REGISTRY_NAMESPACE}\"\necho \"IMAGE_NAME=${IMAGE_NAME}\"\necho \"BUILD_NUMBER=${BUILD_NUMBER}\"\n\ndeclare -A BAR_URL\n\nfor b in `cat bars.txt`;\ndo\n\nBAR_NAME=$(echo $b|cut -f1 -d\"=\")\nBAR_URL[$BAR_NAME]=$(echo $b|cut -f2 -d\"=\")\n\ndone\n\n#docker login -u $ENTITLEMENT_USERNAME -p ENTITLEMENT_PASSWORD cp.icr.io\n\nfor BAR_NAME in ${!BAR_URL[@]};\ndo \necho $BAR_NAME\ncurl -s -k -H 'X-JFrog-Art-Api:AKCp5dKYwFg9MoNFzzp9AG6CGLVtEa9hTWEa2jFnhikuCwfAiAfKm28fKkZBQ1PZpCVkWDgRD' \"${BAR_URL[$BAR_NAME]}\" -o \"${BAR_NAME}.bar\"\n#FROM cp.icr.io/cp/icp4i/ace/ibm-ace-server-prod:11.0.0.9-r2-amd64\nIMAGE_NAME=$(echo $BAR_NAME|tr '[:upper:]' '[:lower:]')\necho $IMAGE_NAME\ncat << eot > Dockerfile\nFROM $DOCKER_SERVER/base-image/ibm-ace-server-prod:12.0.3.0-r1-amd64-TFIT39697\nUSER aceuser\nRUN mkdir -p initial-config/bars\nCOPY \"${BAR_NAME}.bar\" initial-config/bars\nUSER root\nRUN chown -R aceuser:aceuser initial-config/bars\neot\n\necho -e \"Building container image\"\n#ibmcloud cr build -t $REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$TAG .\n# Setting Docker URL to Docker Image \nexport FULL_IMAGE_NAME=$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME\n#ensure docker and buildkit are present if not already in current pipeline-base-image\nwhich buildctl > /dev/null || (curl -fsSL https://github.com/moby/buildkit/releases/download/v0.8.0/buildkit-v0.8.0.linux-amd64.tar.gz | tar zxf - --strip-components=1 -C /usr/bin bin/buildctl)\nwhich docker > /dev/null || (curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-19.03.9.tgz | tar zxf - --strip-components=1 -C /usr/bin docker/docker)\necho -e \"Building container image\"\nibmcloud cr login\nbuildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \\\n  --output type=image,name=${FULL_IMAGE_NAME}:${TAG},push=true \\\n  --export-cache type=registry,ref=${FULL_IMAGE_NAME}:buildcache \\\n  --import-cache type=registry,ref=${FULL_IMAGE_NAME}:buildcache\n\ndone\n\necho Listing BARs\necho\nls *bar\n\necho \"Upload properties files to artefactory\"\nts=$(date '+%d%m%y.%H%M%S')\nexport ARTIFACT_URL=\"https://gbsartifactory.edst.ibm.com/artifactory/NIKECUSTOMSCOMPLIANCE/AppConnect/release/$ts/\";\ncurl -s -k -H 'X-JFrog-Art-Api:AKCp5dKYwFg9MoNFzzp9AG6CGLVtEa9hTWEa2jFnhikuCwfAiAfKm28fKkZBQ1PZpCVkWDgRD' -T bars.txt  \"$ARTIFACT_URL\"\ncurl -s -k -H 'X-JFrog-Art-Api:AKCp5dKYwFg9MoNFzzp9AG6CGLVtEa9hTWEa2jFnhikuCwfAiAfKm28fKkZBQ1PZpCVkWDgRD' -T build.properties  \"$ARTIFACT_URL\""
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          region_id: ibm:yp:eu-gb
+        type: builder
+    name: Docker Build
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers:
+      - type: stage
+    worker: ${private_worker03}
+  - inputs: []
+    jobs:
+      - curatedDockerImage: default
+        deploy_type: kubernetes
+        fail_stage: true
+        name: Deploy
+        script: "#!/bin/bash\nset -x\n\nsource bars.txt\nsource build.properties\n#export HELM_DRIVER=configmap\n\n### temp #####\n\tcp HelmChart/templates/ingress.yaml HelmChart/templates/ingress-old.yaml\n\tsed -i -e '/name:/ s//-old/g' HelmChart/templates/ingress-old.yaml\n\tsed -i -e '/secretName:/ s/ingress-custom-domain/ingress-custom-domain-old/g' HelmChart/templates/ingress-old.yaml\n\tsed -i -e 's/customdomain/customdomainOld/g' HelmChart/templates/ingress-old.yaml\n\nenv\n#env=$(echo $ENV|tr '[:upper:]' '[:lower:]')\n\nfor CHART in $(cat bars.txt|cut -f1 -d\"=\")\ndo\n\n#RELEASE_NAME=$ENV-$CHART\nRELEASE_NAME=$ENV-$CHART\n# Container Registry Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep container-registry|wc -l) -eq 0 ] \n#\tthen \n\t\tkubectl delete secret container-registry -n $ENV\n\n\t\techo \"Create container-registry Secret\"  \n\n\t\tkubectl create secret docker-registry container-registry \\\n\t\t --docker-server=$DOCKER_SERVER \\\n\t\t --docker-username=iamapikey \\\n\t\t --docker-password=\"$DOCKER_PASSWORD\" \\\n\t\t --docker-email=\"iamapikey\" \\\n         -n $ENV\n#\tfi\n\n# Ingress Custom Domain Secret creation\n\tif [ $(kubectl get secret -n $ENV |grep  ingress-custom-domain|wc -l) -eq 0 ] \n\tthen\n\t\techo \"Create ingress-custom-domain Secret\"  \n\t\n\t\t\techo \"-----BEGIN PRIVATE KEY-----\">cis_origin.key\n\t\t\techo \"$CIS_ORIGIN_KEY\">>cis_origin.key\n\t\t\techo \"-----END PRIVATE KEY-----\">>cis_origin.key\n\n\t\t\techo \"-----BEGIN CERTIFICATE-----\">cis_origin.crt\n\t\t\techo \"$CIS_ORIGIN_CRT\">>cis_origin.crt\n\t\t\techo \"-----END CERTIFICATE-----\">>cis_origin.crt\n\t\t\t\n\t       #echo \"$CIS_ORIGIN_KEY\">cis_origin.key\n\t       #echo \"$CIS_ORIGIN_CRT\">cis_origin.crt\n\n\n\t\tkubectl create secret tls ingress-custom-domain --key cis_origin.key --cert cis_origin.crt -n $ENV\n\tfi\n\t\n# Ingress Custom Domain Secret creation (OLD)\n\tif [ $(kubectl get secret -n $ENV |grep  ingress-custom-domain-old|wc -l) -eq 0 ] \n\tthen\n\t\techo \"Create ingress-custom-domain-old Secret\"  \n\t\n\t\t\techo \"-----BEGIN PRIVATE KEY-----\">cis_origin.key\n\t\t\techo \"$CIS_ORIGIN_KEY_OLD\">>cis_origin.key\n\t\t\techo \"-----END PRIVATE KEY-----\">>cis_origin.key\n\n\t\t\techo \"-----BEGIN CERTIFICATE-----\">cis_origin.crt\n\t\t\techo \"$CIS_ORIGIN_CRT_OLD\">>cis_origin.crt\n\t\t\techo \"-----END CERTIFICATE-----\">>cis_origin.crt\n\t\t\t\n\t       #echo \"$CIS_ORIGIN_KEY\">cis_origin.key\n\t       #echo \"$CIS_ORIGIN_CRT\">cis_origin.crt\n\n\n\t\tkubectl create secret tls ingress-custom-domain-old --key cis_origin.key --cert cis_origin.crt -n $ENV\n\tfi\n\n\n# Integration Server Configuration Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep $RELEASE_NAME-$appName-configuration|wc -l) -eq 0 ] \n#\tthen\n        kubectl delete secret $RELEASE_NAME-$appName-configuration -n $ENV\n\n\t\techo \"Create $RELEASE_NAME-$appName-configuration Secret\"  \n\t\n\t       #echo \"$SETDBPARMS\">setdbparms.txt\n\t\t   echo \"kafka::KAFKA token $KAFKA_API_KEY\">setdbparms.txt\n\n\t\tkubectl create secret generic $RELEASE_NAME-$appName-configuration --from-file=setdbparms=./setdbparms.txt --from-file=serverconf=./HelmChart/server.conf.yaml -n $ENV\n#\tfi\n\n\t\n\tcurl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3\n\tchmod 700 get_helm.sh\n\t./get_helm.sh\n\thelm version\n\n\tINGRESS_SUBDOMAIN=$(bx ks cluster get --cluster $PIPELINE_KUBERNETES_CLUSTER_NAME |  grep 'Ingress Subdomain' | tr -d ' '  | cut -d ':' -f2)\n       cat HelmChart/templates/ingress-old.yaml\n       cp -rp HelmChart $CHART\n       helm upgrade --install --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set customdomainOld=$CUSTOM_DOMAIN_OLD --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\n #   helm install --replace --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\ndone"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          kubernetes_cluster: CP4I-AppC-STG
+          region_id: ibm:yp:eu-de
+          resource_group: CCS-PRD
+        type: deployer
+    name: ACE Integration Deployment [Staging-Ingress] [CIS-ALL]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+    worker: ${private_worker03}
+  - inputs:
+      - branch: STG
+        type: git
+        service: github_integrated20
+    jobs:
+      - artifact_dir: ""
+        build_type: shell
+        curatedDockerImage: default
+        fail_stage: true
+        name: Build
+        script: "#!/bin/bash\nset -x\n#source $ARCHIVE_DIR/build.properties\n# temporary set to flab_db \nflag_db=1;\nif [ \"$flag_db\" == \"1\" ]; \nthen\n    source ./pipeline_scripts/Cloudant_Populate.sh\n    source ./pipeline_scripts/APPC_Populate.sh\nfi"
+        type: builder
+    name: Cloudant Populate
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+  - inputs:
+      - job: Image Build
+        stage: Docker Build
+        type: job
+    jobs:
+      - curatedDockerImage: default
+        deploy_type: kubernetes
+        fail_stage: true
+        name: Deploy
+        script: "#!/bin/bash\nset -x\n\nsource bars.txt\nsource build.properties\n#export HELM_DRIVER=configmap\n\n\nenv\n#env=$(echo $ENV|tr '[:upper:]' '[:lower:]')\n\nfor CHART in $(cat bars.txt|cut -f1 -d\"=\")\ndo\n\n#RELEASE_NAME=$ENV-$CHART\nRELEASE_NAME=$ENV-$CHART\n# Container Registry Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep container-registry|wc -l) -eq 0 ] \n#\tthen \n\t\tkubectl delete secret container-registry -n $ENV\n\n\t\techo \"Create container-registry Secret\"  \n\n\t\tkubectl create secret docker-registry container-registry \\\n\t\t --docker-server=$DOCKER_SERVER \\\n\t\t --docker-username=iamapikey \\\n\t\t --docker-password=\"$DOCKER_PASSWORD\" \\\n\t\t --docker-email=\"iamapikey\" \\\n         -n $ENV\n#\tfi\n\n# Ingress Custom Domain Secret creation\n\tif [ $(kubectl get secret -n $ENV |grep  ingress-custom-domain|wc -l) -eq 0 ] \n\tthen\n\t\techo \"Create ingress-custom-domain Secret\"  \n\t\n\t\t\techo \"-----BEGIN PRIVATE KEY-----\">cis_origin.key\n\t\t\techo \"$CIS_ORIGIN_KEY\">>cis_origin.key\n\t\t\techo \"-----END PRIVATE KEY-----\">>cis_origin.key\n\n\t\t\techo \"-----BEGIN CERTIFICATE-----\">cis_origin.crt\n\t\t\techo \"$CIS_ORIGIN_CRT\">>cis_origin.crt\n\t\t\techo \"-----END CERTIFICATE-----\">>cis_origin.crt\n\t\t\t\n\t       #echo \"$CIS_ORIGIN_KEY\">cis_origin.key\n\t       #echo \"$CIS_ORIGIN_CRT\">cis_origin.crt\n\n\n\t\tkubectl create secret tls ingress-custom-domain --key cis_origin.key --cert cis_origin.crt -n $ENV\n\tfi\n\n# Integration Server Configuration Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep $RELEASE_NAME-$appName-configuration|wc -l) -eq 0 ] \n#\tthen\n        kubectl delete secret $RELEASE_NAME-$appName-configuration -n $ENV\n\n\t\techo \"Create $RELEASE_NAME-$appName-configuration Secret\"  \n\t\n\t       #echo \"$SETDBPARMS\">setdbparms.txt\n                echo \"kafka::KAFKA token $KAFKA_API_KEY\">setdbparms.txt\n\n\t\tkubectl create secret generic $RELEASE_NAME-$appName-configuration --from-file=setdbparms=./setdbparms.txt --from-file=serverconf=./HelmChart/server.conf.yaml -n $ENV\n#\tfi\n\n\t\n\tcurl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3\n\tchmod 700 get_helm.sh\n\t./get_helm.sh\n\thelm version\n\n\tINGRESS_SUBDOMAIN=$(bx ks cluster get --cluster $PIPELINE_KUBERNETES_CLUSTER_NAME |  grep 'Ingress Subdomain' | tr -d ' '  | cut -d ':' -f2)\n\n\tcp -rp HelmChart $CHART\n    helm upgrade --install --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\n #   helm install --replace --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\ndone"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          kubernetes_cluster: CP4I-AppC-STG
+          region_id: ibm:yp:eu-de
+          resource_group: CCS-PRD
+        type: deployer
+    name: ACE Integration Deployment [Staging-Ingress]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+  - inputs:
+      - job: Image Build
+        stage: Docker Build
+        type: job
+    jobs:
+      - curatedDockerImage: default
+        deploy_type: kubernetes
+        fail_stage: true
+        name: Deploy
+        script: "#!/bin/bash\nset -x\n\nsource bars.txt\nsource build.properties\nenv\nenv=$(echo $ENV|tr '[:upper:]' '[:lower:]')\necho $env\n\nfor CHART in $(cat bars.txt|cut -f1 -d\"=\")\ndo\n\tif [ $(kubectl get secret -n ace |grep container-registry|wc -l) -eq 0 ] \n\tthen \n\t\techo \"Create container-registry Secret\"  \n\t\tkubectl create secret docker-registry container-registry \\\n\t\t --docker-server=de.icr.io \\\n\t\t --docker-username=iamapikey \\\n\t\t --docker-password=\"$DOCKER_PASSWORD\" \\\n\t\t --docker-email=\"iamapikey\" \\\n                -n ace\n\tfi\n\n\tcurl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3\n\tchmod 700 get_helm.sh\n\t./get_helm.sh\n\thelm version\n\n\tINGRESS_SUBDOMAIN=$(bx ks cluster get --cluster $PIPELINE_KUBERNETES_CLUSTER_NAME |  grep 'Ingress Subdomain' | tr -d ' '  | cut -d ':' -f2)\n\n\tcp -rp HelmChart $CHART\n\thelm upgrade --install --debug $CHART $CHART -n ace --set targetclusterdomain=$INGRESS_SUBDOMAIN --set image.aceonly=de.icr.io/appc-$env/$CHART:$TAG\ndone"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          kubernetes_cluster: CP4I-AppC-STG
+          region_id: ibm:yp:eu-de
+          resource_group: CCS-PRD
+        type: deployer
+    name: ACE Integration Deployment [Staging-Route]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+  - inputs:
+      - job: Image Build
+        stage: Docker Build
+        type: job
+    jobs:
+      - curatedDockerImage: default
+        deploy_type: kubernetes
+        fail_stage: true
+        name: Deploy
+        script: "#!/bin/bash\nset -x\n\nsource bars.txt\nsource build.properties\n#export HELM_DRIVER=configmap\n\n\nenv\n#env=$(echo $ENV|tr '[:upper:]' '[:lower:]')\n\nfor CHART in $(cat bars.txt|cut -f1 -d\"=\")\ndo\n\n#RELEASE_NAME=$ENV-$CHART\nRELEASE_NAME=$ENV-$CHART\n# Container Registry Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep container-registry|wc -l) -eq 0 ] \n#\tthen \n\t\tkubectl delete secret container-registry -n $ENV\n\n\t\techo \"Create container-registry Secret\"  \n\n\t\tkubectl create secret docker-registry container-registry \\\n\t\t --docker-server=$DOCKER_SERVER \\\n\t\t --docker-username=iamapikey \\\n\t\t --docker-password=\"$DOCKER_PASSWORD\" \\\n\t\t --docker-email=\"iamapikey\" \\\n         -n $ENV\n#\tfi\n\n# Ingress Custom Domain Secret creation\n\tif [ $(kubectl get secret -n $ENV |grep  ingress-custom-domain|wc -l) -eq 0 ] \n\tthen\n\t\techo \"Create ingress-custom-domain Secret\"  \n\t\n\t\t\techo \"-----BEGIN PRIVATE KEY-----\">cis_origin.key\n\t\t\techo \"$CIS_ORIGIN_KEY\">>cis_origin.key\n\t\t\techo \"-----END PRIVATE KEY-----\">>cis_origin.key\n\n\t\t\techo \"-----BEGIN CERTIFICATE-----\">cis_origin.crt\n\t\t\techo \"$CIS_ORIGIN_CRT\">>cis_origin.crt\n\t\t\techo \"-----END CERTIFICATE-----\">>cis_origin.crt\n\t\t\t\n\t       #echo \"$CIS_ORIGIN_KEY\">cis_origin.key\n\t       #echo \"$CIS_ORIGIN_CRT\">cis_origin.crt\n\n\n\t\tkubectl create secret tls ingress-custom-domain --key cis_origin.key --cert cis_origin.crt -n $ENV\n\tfi\n\n# Integration Server Configuration Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep $RELEASE_NAME-$appName-configuration|wc -l) -eq 0 ] \n#\tthen\n        kubectl delete secret $RELEASE_NAME-$appName-configuration -n $ENV\n\n\t\techo \"Create $RELEASE_NAME-$appName-configuration Secret\"  \n\t\n\t       \t       #echo \"$SETDBPARMS\">setdbparms.txt\n                      echo \"kafka::KAFKA token $KAFKA_API_KEY\">setdbparms.txt\n\n\t\tkubectl create secret generic $RELEASE_NAME-$appName-configuration --from-file=setdbparms=./setdbparms.txt --from-file=serverconf=./HelmChart/server.conf.yaml -n $ENV\n#\tfi\n\n\t\n\tcurl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3\n\tchmod 700 get_helm.sh\n\t./get_helm.sh\n\thelm version\n\n\tINGRESS_SUBDOMAIN=$(bx ks cluster get --cluster $PIPELINE_KUBERNETES_CLUSTER_NAME |  grep 'Ingress Subdomain' | tr -d ' '  | cut -d ':' -f2)\n\n\tcp -rp HelmChart $CHART\n    helm upgrade --install --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\n #   helm install --replace --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\ndone"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          kubernetes_cluster: CP4I-AppC-POC-VPC
+          region_id: ibm:yp:eu-de
+          resource_group: CCS-POC
+        type: deployer
+    name: ACE Integration Deployment [Staging-Ingress] [POC]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+  - inputs:
+      - job: Build
+        stage: Build BARs
+        type: job
+    jobs:
+      - curatedDockerImage: default
+        deploy_type: kubernetes
+        fail_stage: true
+        name: Deploy
+        script: "#!/bin/bash\nset -x\n\nsource bars.txt\nsource build.properties\n\nenv\n#env=$(echo $ENV|tr '[:upper:]' '[:lower:]')\n\nfor CHART in $(cat bars.txt|cut -f1 -d\"=\"|grep lcpoc)\ndo\n\nRELEASE_NAME=$ENV-$CHART\n#RELEASE_NAME=prd-$CHART\n# Container Registry Secret creation\n\tif [ $(kubectl get secret -n stg |grep container-registry|wc -l) -eq 0 ] \n\tthen \n\t\techo \"Create container-registry Secret\"  \n\n\t\tkubectl create secret docker-registry container-registry \\\n\t\t --docker-server=$DOCKER_SERVER \\\n\t\t --docker-username=iamapikey \\\n\t\t --docker-password=\"$DOCKER_PASSWORD\" \\\n\t\t --docker-email=\"iamapikey\" \\\n         -n stg\n\tfi\n\n# Ingress Custom Domain Secret creation\n\tif [ $(kubectl get secret -n stg |grep  ingress-custom-domain|wc -l) -eq 0 ] \n\tthen\n\t\techo \"Create ingress-custom-domain Secret\"  \n\t\n\t\t\techo \"-----BEGIN PRIVATE KEY-----\">cis_origin.key\n\t\t\techo \"$CIS_ORIGIN_KEY\">>cis_origin.key\n\t\t\techo \"-----END PRIVATE KEY-----\">>cis_origin.key\n\n\t\t\techo \"-----BEGIN CERTIFICATE-----\">cis_origin.crt\n\t\t\techo \"$CIS_ORIGIN_CRT\">>cis_origin.crt\n\t\t\techo \"-----END CERTIFICATE-----\">>cis_origin.crt\n\t\t\t\n\t       #echo \"$CIS_ORIGIN_KEY\">cis_origin.key\n\t       #echo \"$CIS_ORIGIN_CRT\">cis_origin.crt\n\n\n\t\tkubectl create secret tls ingress-custom-domain --key cis_origin.key --cert cis_origin.crt -n stg\n\tfi\n\n# Integration Server Configuration Secret creation\n\tif [ $CHART == 'lcpoc' ] \n\tthen\n        kubectl delete secret $RELEASE_NAME-$appName-configuration -n stg\n\n\t\techo \"Create $RELEASE_NAME-$appName-configuration Secret\"  \n\t\n\t    \t       #echo \"$SETDBPARMS\">setdbparms.txt\n                       echo \"kafka::KAFKA token $KAFKA_API_KEY\">setdbparms.txt\n\t\tsed -i 's/jvmMinHeapSize: 268435456/jvmMinHeapSize: 3221225472/g' ./HelmChart/server.conf.yaml\n\t\tsed -i 's/jvmMaxHeapSize: 3221225472/jvmMaxHeapSize: 9663676416/g' ./HelmChart/server.conf.yaml\n\t\t\n\t\tkubectl create secret generic $RELEASE_NAME-$appName-configuration --from-file=setdbparms=./setdbparms.txt --from-file=serverconf=./HelmChart/server.conf.yaml -n stg\n\telse\n        kubectl delete secret $RELEASE_NAME-$appName-configuration -n stg\n\n\t\techo \"Create $RELEASE_NAME-$appName-configuration Secret\"  \n\t\n\t    echo \"$SETDBPARMS\">setdbparms.txt\n\n\t\tkubectl create secret generic $RELEASE_NAME-$appName-configuration --from-file=setdbparms=./setdbparms.txt --from-file=serverconf=./HelmChart/server.conf.yaml -n stg\n\tfi\n\n\t\n\tcurl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3\n\tchmod 700 get_helm.sh\n\t./get_helm.sh\n\thelm version\n\n\tINGRESS_SUBDOMAIN=$(bx ks cluster get --cluster $PIPELINE_KUBERNETES_CLUSTER_NAME |  grep 'Ingress Subdomain' | tr -d ' '  | cut -d ':' -f2)\n\n\tcp -rp HelmChart $CHART\n\thelm upgrade --install --debug $RELEASE_NAME $CHART -n stg --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=1 --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-prd/$CHART:$TAG\ndone\ndone"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          kubernetes_cluster: CP4I-AppC-POC-VPC
+          region_id: ibm:yp:eu-de
+          resource_group: CCS-POC
+        type: deployer
+    name: ACE Integration Deployment [Staging-Ingress] [POC] [LCPOC]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+    worker: ${private_worker03}
+  - inputs:
+      - branch: STG
+        type: git
+        service: github_integrated20
+    jobs:
+      - artifact_dir: ""
+        build_type: customimage
+        curatedDockerImage: default
+        docker_image: de.icr.io/ccs-dev-sample-app/iib-root:latest
+        fail_stage: true
+        name: Build
+        script: "#!/bin/bash\nset -x\ncat /etc/os-release\nsudo apt-get update \nsudo apt-get install -y git\ngit --version\n#set it temporarily\nflag_code=1\n#source $ARCHIVE_DIR/build.properties\n\nls -l /opt/ibm/iib-10.0.0.11\n# BARs Creation\n#source pipeline_scripts/Versioning.sh AppConnect\nif [ \"$flag_code\" == \"1\" ]; then\n      sudo chmod -R 777 pipeline_scripts\n      cd pipeline_scripts\n      for i in `find ./ -type f|xargs grep -l DB_` ;\n      do \n          sed -i \"s/<ENV>/$ENV/g\" $i;\n          sed -i \"s/<DB_HOST>/$DB_HOST/g\" $i;\n          sed -i \"s/<DB_NAME_CONF>/$APPC_DB_NAME_CONF/g\" $i; \n          sed -i \"s/<DB_AUTHORIZATION>/$DB_AUTHORIZATION/g\" $i;  \n          sed -i \"s/<KAFKA_CONSUMER_INSTANCES>/$KAFKA_CONSUMER_INSTANCES/g\" $i;\n          sed -i \"s/<INTEGRATION_FLOW_INSTANCES>/$INTEGRATION_FLOW_INSTANCES/g\" $i;\n          sed -i \"s/<LOGGER_TOPIC>/$LOGGER_TOPIC/g\" $i;\n          sed -i \"s/<KAFKA_BOOTSTRAP_SERVERS>/$KAFKA_BOOTSTRAP_SERVERS/g\" $i;\n          sed -i \"s/<KAFKA_GROUP_ID>/$KAFKA_GROUP_ID/g\" $i;\n          sed -i \"s/<COS_SUFFIX>/$COS_SUFFIX/g\" $i;\n          sed -i \"s/<COS_API_KEY>/$COS_API_KEY/g\" $i;\n          sed -i \"s/<LOW_FREQUENCY_INTEGRATION_FLOW_INSTANCES>/$LOW_FREQUENCY_INTEGRATION_FLOW_INSTANCES/g\" $i;\n      done\n\n      cat  bars_creation_configuration.sh\n\n      cd ..\n      source pipeline_scripts/build_bars.sh -e $ENV\n      #source pipeline_scripts/build_c4tdeclaration.sh -e $ENV\nfi\n\n[ -z \"$ARCHIVE_DIR\" ] && ARCHIVE_DIR=$PWD\n#echo \"declare -A ARTIFACTS_URL\" >> $ARCHIVE_DIR/bars.txt\n\nfor i in ${!ARTIFACTS_URL[@]};\ndo \n#echo \"ARTIFACTS_URL[$i]=${ARTIFACTS_URL[$i]}\" >> \"$ARCHIVE_DIR/bars.txt\"\necho \"$i=${ARTIFACTS_URL[$i]}\" >> \"$ARCHIVE_DIR/bars.txt\"\ndone;\n\ncat bars.txt\n\nTIME_STAMP=$(date +%d%m%Y%H%M%S) && echo \"TIME_STAMP=${TIME_STAMP}\"\n\nTAG=$(git rev-parse --short HEAD)-${TIME_STAMP}\necho \"TAG=$TAG\">build.properties"
+        type: builder
+    name: Build BARs [TFTS007478834]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+  - inputs:
+      - job: Build
+        stage: Build BARs [TFTS007478834]
+        type: job
+    jobs:
+      - artifact_dir: ""
+        build_type: cr
+        curatedDockerImage: default
+        fail_stage: true
+        image_name: appconnect
+        name: Image Build
+        namespace: appc-stg
+        script: "#!/bin/bash\nset -x\n\ncat bars.txt\nsource bars.txt\nsource build.properties\n\ncat /etc/os-release\n\necho -e \"Build environment variables:\"\necho \"REGISTRY_URL=${REGISTRY_URL}\"\necho \"REGISTRY_NAMESPACE=${REGISTRY_NAMESPACE}\"\necho \"IMAGE_NAME=${IMAGE_NAME}\"\necho \"BUILD_NUMBER=${BUILD_NUMBER}\"\n\ndeclare -A BAR_URL\n\nfor b in `cat bars.txt | grep lcreceive`;\ndo\n\nBAR_NAME=$(echo $b|cut -f1 -d\"=\")\nBAR_URL[$BAR_NAME]=$(echo $b|cut -f2 -d\"=\")\n\ndone\n\n#docker login -u $ENTITLEMENT_USERNAME -p ENTITLEMENT_PASSWORD cp.icr.io\n\nfor BAR_NAME in ${!BAR_URL[@]};\ndo \necho $BAR_NAME\ncurl -s -k -H 'X-JFrog-Art-Api:AKCp5dKYwFg9MoNFzzp9AG6CGLVtEa9hTWEa2jFnhikuCwfAiAfKm28fKkZBQ1PZpCVkWDgRD' \"${BAR_URL[$BAR_NAME]}\" -o \"${BAR_NAME}.bar\"\n#FROM cp.icr.io/cp/icp4i/ace/ibm-ace-server-prod:11.0.0.9-r2-amd64\nIMAGE_NAME=$(echo $BAR_NAME|tr '[:upper:]' '[:lower:]')\necho $IMAGE_NAME\ncat << eot > Dockerfile\nFROM $DOCKER_SERVER/base-image/ibm-ace-server-prod:TFTS007478834\nUSER aceuser\nRUN mkdir -p initial-config/bars\nCOPY \"${BAR_NAME}.bar\" initial-config/bars\nUSER root\nRUN chown -R aceuser:aceuser initial-config/bars\neot\n\necho -e \"Building container image\"\n#ibmcloud cr build -t $REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$TAG .\n# Setting Docker URL to Docker Image \nexport FULL_IMAGE_NAME=$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME\n#ensure docker and buildkit are present if not already in current pipeline-base-image\nwhich buildctl > /dev/null || (curl -fsSL https://github.com/moby/buildkit/releases/download/v0.8.0/buildkit-v0.8.0.linux-amd64.tar.gz | tar zxf - --strip-components=1 -C /usr/bin bin/buildctl)\nwhich docker > /dev/null || (curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-19.03.9.tgz | tar zxf - --strip-components=1 -C /usr/bin docker/docker)\necho -e \"Building container image\"\nibmcloud cr login\nbuildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \\\n  --output type=image,name=${FULL_IMAGE_NAME}:${TAG},push=true \\\n  --export-cache type=registry,ref=${FULL_IMAGE_NAME}:buildcache \\\n  --import-cache type=registry,ref=${FULL_IMAGE_NAME}:buildcache\n\ndone\n\necho Listing BARs\necho\nls *bar"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          region_id: ibm:yp:eu-gb
+        type: builder
+    name: Docker Build [TFTS007478834]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers:
+      - type: stage
+    worker: ${private_worker03}
+  - inputs:
+      - job: Image Build
+        stage: Docker Build [TFTS007478834]
+        type: job
+    jobs:
+      - curatedDockerImage: default
+        deploy_type: kubernetes
+        fail_stage: true
+        name: Deploy
+        script: "#!/bin/bash\nset -x\n\nsource bars.txt\nsource build.properties\n#export HELM_DRIVER=configmap\n\n\nenv\n#env=$(echo $ENV|tr '[:upper:]' '[:lower:]')\n\nfor CHART in $(cat bars.txt|cut -f1 -d\"=\" | grep lcreceive)\ndo\n\n#RELEASE_NAME=$ENV-$CHART\nRELEASE_NAME=$ENV-$CHART\n# Container Registry Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep container-registry|wc -l) -eq 0 ] \n#\tthen \n\t\tkubectl delete secret container-registry -n $ENV\n\n\t\techo \"Create container-registry Secret\"  \n\n\t\tkubectl create secret docker-registry container-registry \\\n\t\t --docker-server=$DOCKER_SERVER \\\n\t\t --docker-username=iamapikey \\\n\t\t --docker-password=\"$DOCKER_PASSWORD\" \\\n\t\t --docker-email=\"iamapikey\" \\\n         -n $ENV\n#\tfi\n\n# Ingress Custom Domain Secret creation\n\tif [ $(kubectl get secret -n $ENV |grep  ingress-custom-domain|wc -l) -eq 0 ] \n\tthen\n\t\techo \"Create ingress-custom-domain Secret\"  \n\t\n\t\t\techo \"-----BEGIN PRIVATE KEY-----\">cis_origin.key\n\t\t\techo \"$CIS_ORIGIN_KEY\">>cis_origin.key\n\t\t\techo \"-----END PRIVATE KEY-----\">>cis_origin.key\n\n\t\t\techo \"-----BEGIN CERTIFICATE-----\">cis_origin.crt\n\t\t\techo \"$CIS_ORIGIN_CRT\">>cis_origin.crt\n\t\t\techo \"-----END CERTIFICATE-----\">>cis_origin.crt\n\t\t\t\n\t       #echo \"$CIS_ORIGIN_KEY\">cis_origin.key\n\t       #echo \"$CIS_ORIGIN_CRT\">cis_origin.crt\n\n\n\t\tkubectl create secret tls ingress-custom-domain --key cis_origin.key --cert cis_origin.crt -n $ENV\n\tfi\n\n# Integration Server Configuration Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep $RELEASE_NAME-$appName-configuration|wc -l) -eq 0 ] \n#\tthen\n        kubectl delete secret $RELEASE_NAME-$appName-configuration -n $ENV\n\n\t\techo \"Create $RELEASE_NAME-$appName-configuration Secret\"  \n\t\n\t       \t       #echo \"$SETDBPARMS\">setdbparms.txt\n                      echo \"kafka::KAFKA token $KAFKA_API_KEY\">setdbparms.txt\n\n\t\tkubectl create secret generic $RELEASE_NAME-$appName-configuration --from-file=setdbparms=./setdbparms.txt --from-file=serverconf=./HelmChart/server.conf.yaml -n $ENV\n#\tfi\n\n\t\n\tcurl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3\n\tchmod 700 get_helm.sh\n\t./get_helm.sh\n\thelm version\n\n\tINGRESS_SUBDOMAIN=$(bx ks cluster get --cluster $PIPELINE_KUBERNETES_CLUSTER_NAME |  grep 'Ingress Subdomain' | tr -d ' '  | cut -d ':' -f2)\n\n\tcp -rp HelmChart $CHART\n    helm upgrade --install --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\n #   helm install --replace --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\ndone"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          kubernetes_cluster: CP4I-AppC-STG
+          region_id: ibm:yp:eu-de
+          resource_group: CCS-PRD
+        type: deployer
+    name: ACE Integration Deployment [Staging-Ingress-TFTS007478834]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers:
+      - type: stage
+  - inputs:
+      - branch: STG
+        type: git
+        service: github_integrated20
+    jobs:
+      - artifact_dir: ""
+        build_type: customimage
+        curatedDockerImage: default
+        docker_image: de.icr.io/ccs-dev-sample-app/iib-root:latest
+        fail_stage: true
+        name: Build
+        script: "#!/bin/bash\nset -x\ncat /etc/os-release\nsudo apt-get update \nsudo apt-get install -y git\ngit --version\n#set it temporarily\nflag_code=1\n#source $ARCHIVE_DIR/build.properties\n\nls -l /opt/ibm/iib-10.0.0.11\n# BARs Creation\n#source pipeline_scripts/Versioning.sh AppConnect\nif [ \"$flag_code\" == \"1\" ]; then\n      sudo chmod -R 777 pipeline_scripts\n      cd pipeline_scripts\n      for i in `find ./ -type f|xargs grep -l DB_` ;\n      do \n          sed -i \"s/<ENV>/$ENV/g\" $i;\n          sed -i \"s/<DB_HOST>/$DB_HOST/g\" $i;\n          sed -i \"s/<DB_NAME_CONF>/$APPC_DB_NAME_CONF/g\" $i; \n          sed -i \"s/<DB_AUTHORIZATION>/$DB_AUTHORIZATION/g\" $i;  \n          sed -i \"s/<KAFKA_CONSUMER_INSTANCES>/$KAFKA_CONSUMER_INSTANCES/g\" $i;\n          sed -i \"s/<INTEGRATION_FLOW_INSTANCES>/$INTEGRATION_FLOW_INSTANCES/g\" $i;\n          sed -i \"s/<LOGGER_TOPIC>/$LOGGER_TOPIC/g\" $i;\n          sed -i \"s/<KAFKA_BOOTSTRAP_SERVERS>/$KAFKA_BOOTSTRAP_SERVERS/g\" $i;\n          sed -i \"s/<KAFKA_GROUP_ID>/$KAFKA_GROUP_ID/g\" $i;\n          sed -i \"s/<COS_SUFFIX>/$COS_SUFFIX/g\" $i;\n          sed -i \"s/<COS_API_KEY>/$COS_API_KEY/g\" $i;\n          sed -i \"s/<LOW_FREQUENCY_INTEGRATION_FLOW_INSTANCES>/$LOW_FREQUENCY_INTEGRATION_FLOW_INSTANCES/g\" $i;\n      done\n\n      cat  bars_creation_configuration.sh\n\n      cd ..\n      source pipeline_scripts/build_bars.sh -e $ENV\n      #source pipeline_scripts/build_c4tdeclaration.sh -e $ENV\nfi\n\n[ -z \"$ARCHIVE_DIR\" ] && ARCHIVE_DIR=$PWD\n#echo \"declare -A ARTIFACTS_URL\" >> $ARCHIVE_DIR/bars.txt\n\nfor i in ${!ARTIFACTS_URL[@]};\ndo \n#echo \"ARTIFACTS_URL[$i]=${ARTIFACTS_URL[$i]}\" >> \"$ARCHIVE_DIR/bars.txt\"\necho \"$i=${ARTIFACTS_URL[$i]}\" >> \"$ARCHIVE_DIR/bars.txt\"\ndone;\n\ncat bars.txt\n\nTIME_STAMP=$(date +%d%m%Y%H%M%S) && echo \"TIME_STAMP=${TIME_STAMP}\"\n\nTAG=$(git rev-parse --short HEAD)-${TIME_STAMP}\necho \"TAG=$TAG\">build.properties"
+        type: builder
+    name: Build BARs [LCRECEIVE]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers:
+      - type: stage
+  - inputs:
+      - job: Build
+        stage: Build BARs
+        type: job
+    jobs:
+      - artifact_dir: ""
+        build_type: cr
+        curatedDockerImage: default
+        fail_stage: true
+        image_name: appconnect
+        name: Image Build
+        namespace: appc-stg
+        script: "#!/bin/bash\nset -x\n\ncat bars.txt\nsource bars.txt\nsource build.properties\n\ncat /etc/os-release\n\necho -e \"Build environment variables:\"\necho \"REGISTRY_URL=${REGISTRY_URL}\"\necho \"REGISTRY_NAMESPACE=${REGISTRY_NAMESPACE}\"\necho \"IMAGE_NAME=${IMAGE_NAME}\"\necho \"BUILD_NUMBER=${BUILD_NUMBER}\"\n\ndeclare -A BAR_URL\n\nfor b in `cat bars.txt | grep lcreceive`;\ndo\n\nBAR_NAME=$(echo $b|cut -f1 -d\"=\")\nBAR_URL[$BAR_NAME]=$(echo $b|cut -f2 -d\"=\")\n\ndone\n\n#docker login -u $ENTITLEMENT_USERNAME -p ENTITLEMENT_PASSWORD cp.icr.io\n\nfor BAR_NAME in ${!BAR_URL[@]};\ndo \necho $BAR_NAME\ncurl -s -k -H 'X-JFrog-Art-Api:AKCp5dKYwFg9MoNFzzp9AG6CGLVtEa9hTWEa2jFnhikuCwfAiAfKm28fKkZBQ1PZpCVkWDgRD' \"${BAR_URL[$BAR_NAME]}\" -o \"${BAR_NAME}.bar\"\n#FROM cp.icr.io/cp/icp4i/ace/ibm-ace-server-prod:11.0.0.9-r2-amd64\nIMAGE_NAME=$(echo $BAR_NAME|tr '[:upper:]' '[:lower:]')\necho $IMAGE_NAME\ncat << eot > Dockerfile\nFROM $DOCKER_SERVER/base-image/ibm-ace-server-prod:12.0.3.0-r1-amd64-TFIT39697\nUSER aceuser\nRUN mkdir -p initial-config/bars\nCOPY \"${BAR_NAME}.bar\" initial-config/bars\nUSER root\nRUN chown -R aceuser:aceuser initial-config/bars\neot\n\necho -e \"Building container image\"\n#ibmcloud cr build -t $REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME:$TAG .\n# Setting Docker URL to Docker Image \nexport FULL_IMAGE_NAME=$REGISTRY_URL/$REGISTRY_NAMESPACE/$IMAGE_NAME\n#ensure docker and buildkit are present if not already in current pipeline-base-image\nwhich buildctl > /dev/null || (curl -fsSL https://github.com/moby/buildkit/releases/download/v0.8.0/buildkit-v0.8.0.linux-amd64.tar.gz | tar zxf - --strip-components=1 -C /usr/bin bin/buildctl)\nwhich docker > /dev/null || (curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-19.03.9.tgz | tar zxf - --strip-components=1 -C /usr/bin docker/docker)\necho -e \"Building container image\"\nibmcloud cr login\nbuildctl build --frontend dockerfile.v0 --local context=. --local dockerfile=. \\\n  --output type=image,name=${FULL_IMAGE_NAME}:${TAG},push=true \\\n  --export-cache type=registry,ref=${FULL_IMAGE_NAME}:buildcache \\\n  --import-cache type=registry,ref=${FULL_IMAGE_NAME}:buildcache\n\ndone\n\necho Listing BARs\necho\nls *bar"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          region_id: ibm:yp:eu-gb
+        type: builder
+    name: Docker Build [LCRECEIVE]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers:
+      - type: stage
+    worker: ${private_worker03}
+  - inputs:
+      - job: Image Build
+        stage: Docker Build [LCRECEIVE]
+        type: job
+    jobs:
+      - curatedDockerImage: default
+        deploy_type: kubernetes
+        fail_stage: true
+        name: Deploy
+        script: "#!/bin/bash\nset -x\n\nsource bars.txt\nsource build.properties\n#export HELM_DRIVER=configmap\n\n\nenv\n#env=$(echo $ENV|tr '[:upper:]' '[:lower:]')\n\nfor CHART in $(cat bars.txt|cut -f1 -d\"=\" | grep lcreceive)\ndo\n\n#RELEASE_NAME=$ENV-$CHART\nRELEASE_NAME=$ENV-$CHART\n# Container Registry Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep container-registry|wc -l) -eq 0 ] \n#\tthen \n\t\tkubectl delete secret container-registry -n $ENV\n\n\t\techo \"Create container-registry Secret\"  \n\n\t\tkubectl create secret docker-registry container-registry \\\n\t\t --docker-server=$DOCKER_SERVER \\\n\t\t --docker-username=iamapikey \\\n\t\t --docker-password=\"$DOCKER_PASSWORD\" \\\n\t\t --docker-email=\"iamapikey\" \\\n         -n $ENV\n#\tfi\n\n# Ingress Custom Domain Secret creation\n\tif [ $(kubectl get secret -n $ENV |grep  ingress-custom-domain|wc -l) -eq 0 ] \n\tthen\n\t\techo \"Create ingress-custom-domain Secret\"  \n\t\n\t\t\techo \"-----BEGIN PRIVATE KEY-----\">cis_origin.key\n\t\t\techo \"$CIS_ORIGIN_KEY\">>cis_origin.key\n\t\t\techo \"-----END PRIVATE KEY-----\">>cis_origin.key\n\n\t\t\techo \"-----BEGIN CERTIFICATE-----\">cis_origin.crt\n\t\t\techo \"$CIS_ORIGIN_CRT\">>cis_origin.crt\n\t\t\techo \"-----END CERTIFICATE-----\">>cis_origin.crt\n\t\t\t\n\t       #echo \"$CIS_ORIGIN_KEY\">cis_origin.key\n\t       #echo \"$CIS_ORIGIN_CRT\">cis_origin.crt\n\n\n\t\tkubectl create secret tls ingress-custom-domain --key cis_origin.key --cert cis_origin.crt -n $ENV\n\tfi\n\n# Integration Server Configuration Secret creation\n#\tif [ $(kubectl get secret -n $ENV |grep $RELEASE_NAME-$appName-configuration|wc -l) -eq 0 ] \n#\tthen\n        kubectl delete secret $RELEASE_NAME-$appName-configuration -n $ENV\n\n\t\techo \"Create $RELEASE_NAME-$appName-configuration Secret\"  \n\t\n\t       \t       #echo \"$SETDBPARMS\">setdbparms.txt\n                      echo \"kafka::KAFKA token $KAFKA_API_KEY\">setdbparms.txt\n\n\t\tkubectl create secret generic $RELEASE_NAME-$appName-configuration --from-file=setdbparms=./setdbparms.txt --from-file=serverconf=./HelmChart/server.conf.yaml -n $ENV\n#\tfi\n\n\t\n\tcurl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3\n\tchmod 700 get_helm.sh\n\t./get_helm.sh\n\thelm version\n\n\tINGRESS_SUBDOMAIN=$(bx ks cluster get --cluster $PIPELINE_KUBERNETES_CLUSTER_NAME |  grep 'Ingress Subdomain' | tr -d ' '  | cut -d ':' -f2)\n\n\tcp -rp HelmChart $CHART\n    helm upgrade --install --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\n #   helm install --replace --debug $RELEASE_NAME $CHART -n $ENV --set targetclusterdomain=$INGRESS_SUBDOMAIN --set aceonly.replicaCount=$replicaCount --set customdomain=$CUSTOM_DOMAIN --set image.aceonly=$DOCKER_SERVER/appc-$ENV/$CHART:$TAG\ndone"
+        target:
+          account_guid: c8d39513f3344c31a9cbf03b80606719
+          api_key: ""
+          kubernetes_cluster: CP4I-AppC-STG
+          region_id: ibm:yp:eu-de
+          resource_group: CCS-PRD
+        type: deployer
+    name: ACE Integration Deployment [Staging-Ingress-LCRECEIVE]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers:
+      - type: stage
+  - inputs:
+      - branch: STG
+        type: git
+        service: github_integrated20
+    jobs:
+      - artifact_dir: ""
+        build_type: shell
+        curatedDockerImage: default
+        fail_stage: true
+        name: Build
+        script: |-
+          #!/bin/bash
+          #set -x
+          bash pipeline_scripts/detect_changed.sh  -p $ENV -d2  -b ${BUILD_NUMBER}
+        type: builder
+    name: DETECT CHANGES & Versioning[Not Used]
+    permission:
+      execute: TOOLCHAIN_ADMINS
+    properties: []
+    triggers: []
+properties:
+  - name: DOCKER_USERNAME
+    type: text
+    value: iamapikey
+  - name: DOCKER_PASSWORD
+    type: secure
+  - name: DB_USER
+    type: text
+    value: 2074c02f-b3cb-44cd-916f-8edb3fd912d5-bluemix
+  - name: DB_PASS
+    type: secure
+  - name: DB_HOST
+    type: text
+    value: 2074c02f-b3cb-44cd-916f-8edb3fd912d5-bluemix.cloudantnosqldb.appdomain.cloud
+  - name: DB_AUTHORIZATION
+    type: secure
+  - name: APPC_DB_NAME_CONF
+    type: text
+    value: appconnect-service-configs-db-stg-nike
+  - name: APPC_DB_NAME_TRX
+    type: text
+    value: appconnect-service-transactions-db-stg-nike
+  - name: BARS_TXT
+    type: file
+    value: bars.txt
+  - name: ENV
+    type: text
+    value: stg
+  - name: BUILD_PROPERTIES
+    type: file
+    value: build.properties
+  - name: LOGDNA_URL
+    type: text
+    value: https://logs.eu-de.logging.cloud.ibm.com/logs/ingest?hostname=appconnect\&now=
+  - name: LOGDNA_TOKEN
+    type: secure
+  - name: LOGGER_TOPIC
+    type: text
+    value: stg.appconnect.logger
+  - name: KAFKA_BOOTSTRAP_SERVERS
+    type: text
+    value: kafka-1.mh-yqlxtgxhpkrrhqhjqtrm-4c201a12d7add7c99d2b22e361c6f175-0000.eu-de.containers.appdomain.cloud:9093,kafka-2.mh-yqlxtgxhpkrrhqhjqtrm-4c201a12d7add7c99d2b22e361c6f175-0000.eu-de.containers.appdomain.cloud:9093,kafka-0.mh-yqlxtgxhpkrrhqhjqtrm-4c201a12d7add7c99d2b22e361c6f175-0000.eu-de.containers.appdomain.cloud:9093
+  - name: KAFKA_CONSUMER_INSTANCES
+    type: text
+    value: "9"
+  - name: INTEGRATION_FLOW_INSTANCES
+    type: text
+    value: "49"
+  - name: APPC_DOMAIN_INGRESS
+    type: text
+    value: cp4i-appc-stg-fcca88b40adf5b4ce39299b7f888356d-0000.eu-de.containers.appdomain.cloud
+  - name: NOTIFICATION_DB_USER
+    type: text
+    value: 8f42e063-ba6b-4530-9fdd-7f32b5da29c4-bluemix
+  - name: NOTIFICATION_DB_PASS
+    type: secure
+  - name: NOTIFICATION_DB_NAME
+    type: text
+    value: notificationservice-configuration-db-stg-nikelc
+  - name: NOTIFICATION_DB_HOST
+    type: text
+    value: 8f42e063-ba6b-4530-9fdd-7f32b5da29c4-bluemix.cloudantnosqldb.appdomain.cloud
+  - name: COS_API_KEY
+    type: text
+    value: f4eQ8qdPQPX5-Q9R0lBmBQ1RNGhGx7XzmhkB3RwFeuHj
+  - name: CUSTOM_DOMAIN
+    type: text
+    value: ibm-customscompliancetest.com
+  - name: SETDBPARMS
+    type: secure
+  - name: appName
+    type: text
+    value: ibm-ace-server-icp4i-prod
+  - name: APPC_DOMAIN
+    type: text
+    value: ibm-customscompliancetest.com
+  - name: APIC_DOMAIN
+    type: text
+    value: api-stg.ibm-customscompliancetest.com
+  - name: APIC_ORG_SPACE
+    type: text
+    value: ccs-cf-prd-ccs-cf-stg
+  - name: APIC_CATALOG
+    type: text
+    value: customs-compliance-system
+  - name: KAFKA_GROUP_ID
+    type: text
+    value: stg-AppConnectLogger
+  - name: REGION
+    type: text
+    value: frk
+  - name: LOW_FREQUENCY_INTEGRATION_FLOW_INSTANCES
+    type: text
+    value: "19"
+  - name: replicaCount
+    type: text
+    value: "6"
+  - name: odmUser
+    type: text
+    value: nike_ccs_prod_odm.fid@t1162
+  - name: odmToken
+    type: secure
+  - name: DOCKER_SERVER
+    type: text
+    value: uk.icr.io
+  - name: COS_ENV_SUFFIX
+    type: text
+    value: stg
+  - name: KAFKA_API_KEY
+    type: secure
+  - name: CUSTOM_DOMAIN_OLD
+    type: text
+    value: ibm-customscompliance.com
+  - name: BATCH_FLOW_INSTANCES
+    type: text
+    value: "5"
+  - name: SUB_BATCH_FLOW_INSTANCES
+    type: text
+    value: "15"
+  - name: C4T_CLIENT_SECRET
+    type: secure
+  - name: OKTA_CLIENT_SECRET
+    type: secure
+  - name: OKTA_CLIENT_SECRET_V2
+    type: secure
+  - name: OKTA_CLIENT_SECRET_V3
+    type: secure
+  - name: IAM_KEY
+    type: secure
+  - name: COS_KEY
+    type: secure
+  - name: STORAGE_COS_ACCESS_KEY
+    type: secure
+  - name: STORAGE_COS_SECRET_ACCESS_KEY
+    type: secure
+  - name: STORAGE_COS_API_KEY
+    type: secure
+  - name: KAFKA_CONSUMER_ENDPOINT
+    type: text
+    value: https://stg-kafkaconsumer.cp4i-appc-stg-fcca88b40adf5b4ce39299b7f888356d-0000.eu-de.containers.appdomain.cloud/logger
+  - name: featuretoggle_DB_NAME
+    type: text
+    value: appconnect-service-featuretoggle-db-stg-nike
+
